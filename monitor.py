@@ -2,7 +2,6 @@
 import requests
 import time
 import logging
-import json
 
 # ---------------- 配置参数 ----------------
 # 企业微信 Bot 的 Webhook 地址（请替换为你自己的）
@@ -27,6 +26,13 @@ state = {
 
 # 用于记录已经推送过的代币（避免重复推送）
 pushed_symbols = set()
+
+# 用于记录已推送资金费率的交易所（避免重复推送）
+pushed_funding_rates = {
+    'binance': False,
+    'okx': False,
+    'bybit': False
+}
 
 # ---------------- 企业微信推送函数 ----------------
 def send_wechat_message(message):
@@ -165,17 +171,18 @@ def get_okx_price(instId):
     return None
 
 # ---------------- Bybit API 相关函数 ----------------
+# ---------------- Bybit API 相关函数 ----------------
 def get_bybit_symbols():
     """
-    获取 Bybit 交易对列表
+    获取 Bybit 交易对列表（V5）
     """
-    url = 'https://api.bybit.com/v2/public/symbols'
+    url = 'https://api.bybit.com/v5/market/instruments'
     try:
         resp = requests.get(url, timeout=10)
         data = resp.json()
         symbols = []
-        if data.get('ret_code') == 0:
-            for info in data.get('result', []):
+        if data.get('ret_code') == 0 and 'result' in data:
+            for info in data['result']:
                 if info.get('name'):
                     symbols.append(info['name'])
         return symbols
@@ -185,47 +192,46 @@ def get_bybit_symbols():
 
 def get_bybit_funding_rate(symbol):
     """
-    获取 Bybit 资金费率（返回百分比）
+    获取 Bybit 资金费率（V5）返回百分比
     """
-    url = f'https://api.bybit.com/v2/public/funding/prev-funding-rate?symbol={symbol}'
+    url = f'https://api.bybit.com/v5/public/funding/prev-funding-rate?symbol={symbol}'
     try:
         resp = requests.get(url, timeout=10)
         data = resp.json()
-        if data.get('ret_code') == 0 and data.get('result'):
-            rate = float(data['result'].get('funding_rate', 0))
-            return rate * 100
+        if data.get('ret_code') == 0 and 'result' in data:
+            rate = float(data['result'][0].get('funding_rate', 0))
+            return rate * 100  # 转换为百分比
     except Exception as e:
         logging.error(f"获取 Bybit {symbol} 资金费率异常: {e}")
     return None
 
 def get_bybit_open_interest(symbol):
     """
-    获取 Bybit 持仓量（部分接口版本可能有所不同）
+    获取 Bybit 持仓量（V5）
     """
-    url = f'https://api.bybit.com/v2/public/open-interest?symbol={symbol}'
+    url = f'https://api.bybit.com/v5/public/open-interest?symbol={symbol}'
     try:
         resp = requests.get(url, timeout=10)
         data = resp.json()
-        if data.get('ret_code') == 0 and data.get('result'):
-            return float(data['result'].get('open_interest', 0))
+        if data.get('ret_code') == 0 and 'result' in data:
+            return float(data['result'][0].get('open_interest', 0))
     except Exception as e:
         logging.error(f"获取 Bybit {symbol} 持仓量异常: {e}")
     return None
 
 def get_bybit_price(symbol):
     """
-    获取 Bybit 最新价格
+    获取 Bybit 最新价格（V5）
     """
-    url = f'https://api.bybit.com/v2/public/tickers?symbol={symbol}'
+    url = f'https://api.bybit.com/v5/market/tickers?symbol={symbol}'
     try:
         resp = requests.get(url, timeout=10)
         data = resp.json()
-        if data.get('ret_code') == 0 and data.get('result'):
+        if data.get('ret_code') == 0 and 'result' in data:
             return float(data['result'][0].get('last_price', 0))
     except Exception as e:
         logging.error(f"获取 Bybit {symbol} 价格异常: {e}")
     return None
-
 # ---------------- 主监控循环 ----------------
 def monitor_exchange(exchange, symbols_func, funding_func, price_func, oi_func):
     symbols = symbols_func()
@@ -239,38 +245,39 @@ def monitor_exchange(exchange, symbols_func, funding_func, price_func, oi_func):
         funding_rate = funding_func(symbol)
         oi = oi_func(symbol)
 
-        # 资金费率检测
-        if funding_rate is not None and funding_rate < -1:
+        # 资金费率检测（小于-1%推送）
+        if funding_rate is not None and funding_rate < -1 and not pushed_funding_rates[exchange]:
             msg = f"[{exchange}] {symbol} 资金费率告警：{funding_rate:.2f}% (< -1%)"
             logging.info(msg)
             send_wechat_message(msg)
+            pushed_funding_rates[exchange] = True  # 标记为已推送
 
-        # 1分钟价格涨幅超过10%检测
-        if price is not None:
+        # 1分钟价格涨幅超过5%且持仓量增长超过15%时推送
+        if price is not None and oi is not None:
             prev_price = state[exchange].get(symbol, {}).get('price')
-            if prev_price is not None and prev_price > 0:
-                change = ((price - prev_price) / prev_price) * 100
-                if change > 10:
-                    msg = f"[{exchange}] {symbol} 1 分钟内价格上涨 {change:.2f}%（{prev_price} -> {price}）"
-                    logging.info(msg)
-                    send_wechat_message(msg)
+            prev_oi = state[exchange].get(symbol, {}).get('oi')
 
-            # 更新代币价格
+            # 检查价格涨幅是否超过 5%
+            if prev_price is not None and prev_price > 0:
+                price_change = ((price - prev_price) / prev_price) * 100
+            else:
+                price_change = 0
+
+            # 检查持仓量是否增长超过 15%
+            if prev_oi is not None and prev_oi > 0:
+                oi_change = ((oi - prev_oi) / prev_oi) * 100
+            else:
+                oi_change = 0
+
+            if price_change > 5 and oi_change > 15:
+                msg = f"[{exchange}] {symbol} 1 分钟内价格上涨 {price_change:.2f}%，持仓量增长 {oi_change:.2f}%"
+                logging.info(msg)
+                send_wechat_message(msg)
+
+            # 更新代币的价格和持仓量
             if symbol not in state[exchange]:
                 state[exchange][symbol] = {}
             state[exchange][symbol]['price'] = price
-
-        # 合约持仓量检测（较上次增长超过 15%）
-        if oi is not None:
-            prev_oi = state[exchange].get(symbol, {}).get('oi')
-            if prev_oi is not None and prev_oi > 0:
-                change = ((oi - prev_oi) / prev_oi) * 100
-                if change > 15:
-                    msg = f"[{exchange}] {symbol} 持仓量增长 {change:.2f}%（{prev_oi} -> {oi}）"
-                    logging.info(msg)
-                    send_wechat_message(msg)
-
-            # 更新合约持仓量
             state[exchange][symbol]['oi'] = oi
 
         # 标记该代币已推送
